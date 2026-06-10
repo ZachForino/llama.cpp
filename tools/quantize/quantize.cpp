@@ -69,6 +69,9 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "F16",      LLAMA_FTYPE_MOSTLY_F16,      "14.00G, +0.0020 ppl @ Mistral-7B",  },
     { "BF16",     LLAMA_FTYPE_MOSTLY_BF16,     "14.00G, -0.0050 ppl @ Mistral-7B",  },
     { "F32",      LLAMA_FTYPE_ALL_F32,         "26.00G              @ 7B",          },
+    // Adding MOSTLY_MXFP4 and MOSTLY_NVFP4
+    { "MXFP4", LLAMA_FTYPE_MOSTLY_MXFP4, " 4.25 bpw MXFP4", },
+    { "NVFP4", LLAMA_FTYPE_MOSTLY_NVFP4, " 4.50 bpw NVFP4", },
     // Note: Ensure COPY comes after F32 to avoid ftype 0 from matching.
     { "COPY",     LLAMA_FTYPE_ALL_F32,         "only copy tensors, no quantizing",  },
 };
