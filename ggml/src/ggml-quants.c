@@ -296,6 +296,10 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
     }
 }
 
+// kvalues_mxfp4 = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12]
+// x = value to quantize
+// e = scale factor as a dequantized float
+// best_index = best E2M1 value (scale_factor*kvalue_mxfp4[best_index] is the closest value to x)
 static inline int best_index_mxfp4(float x, float e) {
     int best_index = 0;
     float best_err = fabsf(kvalues_mxfp4[0]*e - x);
@@ -309,12 +313,133 @@ static inline int best_index_mxfp4(float x, float e) {
     return best_index;
 }
 
+// n is the block size - QK_NVFP4 or QK_MXFP4
+static float fp4_block_error(const float * GGML_RESTRICT x, int n, float d) {
+    float err = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        const float xr   = d * kvalues_mxfp4[best_index_mxfp4(x[j], d)];
+        const float diff = x[j] - xr;
+        err += diff * diff;
+    }
+    return err;
+}
+
+// x = pointer to k floats (f32 weights), y = pointer to output buffer
 void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
-    static const int qk = QK_MXFP4;
+    static const int qk = QK_MXFP4; // qk = 32;
 
     assert(k % qk == 0);
 
-    const int nb = k / qk;
+    const int nb = k / qk; // Number of chunks of size 32
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+
+            if (amax < fabsf(v)) {
+                amax = fabsf(v);
+            }
+        }
+        
+        uint8_t best_e = 0;
+
+        if (amax > 0.0f) {
+            const uint8_t e0 = (uint8_t) (floorf(log2f(amax)) - 2 + 127);
+
+            float best_err = FLT_MAX; // largest possible float
+            for (int t = -1; t <= 1; ++t) {
+                const int ec = (int)e0 + t;
+                if (ec < 1 || ec > 254) {
+                    continue;
+                }
+                const float err = fp4_block_error(&x[i*qk], qk, GGML_E8M0_TO_FP32_HALF((uint8_t)ec));
+                if (err < best_err) {
+                    best_err = err;
+                    best_e   = (uint8_t)ec; // e = E8M0 scale factor
+                }
+            }
+        }
+
+        y[i].e = best_e; // E8M0 scale factor for i = e
+        const float d = GGML_E8M0_TO_FP32_HALF(best_e); // d = 2^{e-128} (dequantized scale factor)
+
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t x0 = best_index_mxfp4(x[i*qk + 0    + j], d); // Set first nibble of byte
+            const uint8_t x1 = best_index_mxfp4(x[i*qk + qk/2 + j], d); // Set second nibble of byte
+
+            y[i].qs[j]  = x0 | (x1 << 4); // x0 is bits 0:3, x1 is bits 4:7
+        }
+    }
+}
+
+// x = pointer to k floats (f32 weights), y = pointer to output buffer
+void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_NVFP4; // qk = 64
+    static const int qk_sub = QK_NVFP4_SUB; // qk_sub = 16
+    static const int n_sub = QK_NVFP4 / QK_NVFP4_SUB; // n_sub = number of size 16 blocks
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk; // Number of chunks of size 64
+
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < n_sub; s++) {
+            const float * xb = x + i*qk + s*qk_sub; // ith chunk of 64 and sth chunk of 16 within that 64 chunk
+
+            float amax = 0.0f;
+            for (int j = 0; j < qk_sub; j++) {
+                if (amax < fabsf(xb[j])) {
+                    amax = fabsf(xb[j]);
+                }
+            }
+
+            if (amax == 0.0f) {
+                y[i].d[s] = 0;
+                memset(&y[i].qs[s*(qk_sub/2)], 0, qk_sub/2);
+                continue;
+            }
+
+            const uint8_t ue0 = ggml_fp32_to_ue4m3(amax / 6.0f);
+
+            uint8_t best_ue  = ue0;
+            float   best_err = FLT_MAX;
+            for (int t = -4; t <= 2; ++t) {
+                const int uc = (int)ue0 + t;
+                if (uc < 1 || uc > 0x7E) {
+                    continue;
+                }
+                const float err = fp4_block_error(xb, qk_sub, ggml_ue4m3_to_fp32((uint8_t)uc));
+                if (err < best_err) {
+                    best_err = err;
+                    best_ue  = (uint8_t)uc; // UE4M3 scale: amax / 6.0 maps the max E2M1 value (6.0) to amax
+                }
+            }
+
+            y[i].d[s] = best_ue; // UE4M3 scale factor for block i
+            const float d = ggml_ue4m3_to_fp32(best_ue); // float version of scale factor
+
+            for (int j = 0; j < qk_sub/2; ++j) {
+                const uint8_t x0 = best_index_mxfp4(xb[0        + j], d); // Set first nibble of byte
+                const uint8_t x1 = best_index_mxfp4(xb[qk_sub/2 + j], d); // Set second nibble of byte
+
+                y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4); // x0 is bits 0:3, x1 is bits 4:7
+            }
+        }
+    }
+}
+
+/*
+Original versions for MXFP4 and NVFP4 Quantization
+
+// x = pointer to k floats (f32 weights), y = pointer to output buffer
+void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP4; // qk = 32;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk; // Number of chunks of size 32
 
     for (int i = 0; i < nb; i++) {
         float amax = 0.0f; // absolute max
@@ -327,34 +452,37 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
             }
         }
 
+        // e = E8M0 scale factor
         const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
 
+        // d = 2^{e-128} (dequantized scale factor)
         const float d = GGML_E8M0_TO_FP32_HALF(e);
-
+        
+        // E8M0 scale factor for block i = e
         y[i].e = e;
 
         for (int j = 0; j < qk/2; ++j) {
-            const uint8_t x0 = best_index_mxfp4(x[i*qk + 0    + j], d);
-            const uint8_t x1 = best_index_mxfp4(x[i*qk + qk/2 + j], d);
+            const uint8_t x0 = best_index_mxfp4(x[i*qk + 0    + j], d); // Set first nibble of byte
+            const uint8_t x1 = best_index_mxfp4(x[i*qk + qk/2 + j], d); // Set second nibble of byte
 
-            y[i].qs[j]  = x0;
-            y[i].qs[j] |= x1 << 4;
+            y[i].qs[j]  = x0 | (x1 << 4); // x0 is bits 0:3, x1 is bits 4:7
         }
     }
 }
 
+// x = pointer to k floats (f32 weights), y = pointer to output buffer
 void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
-    static const int qk = QK_NVFP4;
-    static const int qk_sub = QK_NVFP4_SUB;
-    static const int n_sub = QK_NVFP4 / QK_NVFP4_SUB;
+    static const int qk = QK_NVFP4; // qk = 64
+    static const int qk_sub = QK_NVFP4_SUB; // qk_sub = 16
+    static const int n_sub = QK_NVFP4 / QK_NVFP4_SUB; // n_sub = number of size 16 blocks
 
     assert(k % qk == 0);
 
-    const int nb = k / qk;
+    const int nb = k / qk; // Number of chunks of size 64
 
     for (int i = 0; i < nb; i++) {
         for (int s = 0; s < n_sub; s++) {
-            const float * xb = x + i*qk + s*qk_sub;
+            const float * xb = x + i*qk + s*qk_sub; // ith chunk of 64 and sth chunk of 16 within that 64 chunk
 
             float amax = 0.0f;
             for (int j = 0; j < qk_sub; j++) {
@@ -365,18 +493,23 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
 
             // UE4M3 scale: amax / 6.0 maps the max E2M1 value (6.0) to amax
             const uint8_t ue = ggml_fp32_to_ue4m3(amax / 6.0f);
+
+            // UE4M3 scale factor for block i
             y[i].d[s] = ue;
+
+            // float version of scale factor
             const float d = ggml_ue4m3_to_fp32(ue);
 
             for (int j = 0; j < qk_sub/2; ++j) {
-                const uint8_t x0 = best_index_mxfp4(xb[0        + j], d);
-                const uint8_t x1 = best_index_mxfp4(xb[qk_sub/2 + j], d);
+                const uint8_t x0 = best_index_mxfp4(xb[0        + j], d); // Set first nibble of byte
+                const uint8_t x1 = best_index_mxfp4(xb[qk_sub/2 + j], d); // Set second nibble of byte
 
-                y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4);
+                y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4); // x0 is bits 0:3, x1 is bits 4:7
             }
         }
     }
 }
+*/
 
 void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0;
