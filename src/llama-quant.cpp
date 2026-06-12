@@ -760,6 +760,32 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
     return new_size;
 }
 
+// Check if the tensor can have a .scale value
+static bool tensor_has_nvfp4_scale_slot(const std::string & name) {
+    if (name == "output.weight") { // Output head doesn't start with blk. but is eligible for a .scale
+        return true;
+    }
+    if (name.compare(0, 4, "blk.") != 0) { // All eligible tensors start with blk.
+        return false;
+    }
+    static const char * const suffixes[] = {
+        ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
+        ".attn_qkv.weight", ".attn_gate.weight",
+        ".ffn_gate.weight", ".ffn_down.weight", ".ffn_up.weight",
+        ".ffn_gate_shexp.weight", ".ffn_down_shexp.weight", ".ffn_up_shexp.weight",
+        ".ffn_gate_exps.weight", ".ffn_down_exps.weight", ".ffn_up_exps.weight",
+        ".ssm_in.weight", ".ssm_out.weight", ".ssm_alpha.weight", ".ssm_beta.weight",
+        ".nextn.eh_proj.weight", ".nextn.shared_head_head.weight",
+    };
+    for (const char * suffix : suffixes) { // Check if last n characters of name match any of the suffixes
+        const size_t n = strlen(suffix);
+        if (name.size() > n && name.compare(name.size() - n, n, suffix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 //
 // imatrix requirement check
 //
@@ -1015,6 +1041,17 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<gguf_context_ptr> ctx_outs(n_split);
     ctx_outs[0] = std::move(ctx_out);
 
+    // companion ".scale" tensors for NVFP4 per-tensor scales
+    const ggml_init_params scale_init = {
+        /*.mem_size   =*/ (tensors.size() + 1)*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_scales { ggml_init(scale_init) };
+
+    std::vector<ggml_tensor *>      scale_tensors(tensors.size(), nullptr);
+    std::vector<std::vector<float>> scale_values (tensors.size());
+
     // flag for --dry-run
     bool will_require_imatrix = false;
 
@@ -1041,6 +1078,22 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
 
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
+
+        // If target type is NVFP4 and current type is not NVFP4
+        if (metadata[i].target_type == GGML_TYPE_NVFP4 && tensor->type != GGML_TYPE_NVFP4 &&
+                tensor_has_nvfp4_scale_slot(metadata[i].name)) {
+            const int64_t n_scales = tensor->ne[2] > 1 ? tensor->ne[2] : 1;
+
+            ggml_tensor * t_scale = ggml_new_tensor_1d(ctx_scales.get(), GGML_TYPE_F32, n_scales);
+            const std::string scale_name =
+                metadata[i].name.substr(0, metadata[i].name.size() - strlen(".weight")) + ".scale";
+            ggml_set_name(t_scale, scale_name.c_str());
+
+            gguf_add_tensor(ctx_outs[i_split].get(), t_scale);
+
+            scale_tensors[i] = t_scale;
+            scale_values[i].resize(n_scales);
+        }
 
         if (params->imatrix) {
             metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped);
@@ -1077,6 +1130,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<no_init<uint8_t>> read_data;
     std::vector<no_init<uint8_t>> work;
     std::vector<no_init<float>> f32_conv_buf;
+    std::vector<no_init<float>> f32_scaled_buf;
 
     int cur_split = -1;
     std::ofstream fout;
@@ -1158,6 +1212,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             // the --dry-run option calculates the final quantization size without quantizing
             if (quantize) {
                 new_size = ggml_nrows(tensor) * ggml_row_size(new_type, tensor->ne[0]);
+                if (scale_tensors[i]) {
+                    new_size += scale_values[i].size()*sizeof(float);
+                }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB (%s)\n",
                                tensor_size/1024.0/1024.0,
                                new_size/1024.0/1024.0,
@@ -1241,6 +1298,35 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
                 const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
+                // NVFP4: compute the per-tensor (per-expert) fp32 scale and pre-divide so
+                // the UE4M3 block scales are relative to it (cannot divide in place - for
+                // F32 input tensors f32_data aliases the mmap'd file)
+                if (scale_tensors[i]) {
+                    if (f32_scaled_buf.size() < (size_t)nelements) {
+                        f32_scaled_buf.resize(nelements);
+                    }
+                    for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+                        const float * src = f32_data                        + i03*nelements_matrix;
+                        float       * dst = (float *) f32_scaled_buf.data() + i03*nelements_matrix;
+
+                        float amax = 0.0f;
+                        for (int64_t j = 0; j < nelements_matrix; ++j) {
+                            amax = std::max(amax, fabsf(src[j]));
+                        }
+
+                        // 448 = max UE4M3 block scale, 6 = max E2M1 value
+                        const float scale_fp32 = amax > 0.0f ? amax/(448.0f*6.0f) : 1.0f;
+                        const float id         = 1.0f/scale_fp32;
+
+                        for (int64_t j = 0; j < nelements_matrix; ++j) {
+                            dst[j] = src[j]*id;
+                        }
+
+                        scale_values[i][i03] = scale_fp32;
+                    }
+                    f32_data = (float *) f32_scaled_buf.data();
+                }
+
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
@@ -1263,6 +1349,18 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             // write tensor data + padding
             fout.write((const char *) new_data, new_size);
             zeros(fout, GGML_PAD(new_size, align) - new_size);
+
+            // write companion ".scale" tensor data + padding
+            if (scale_tensors[i]) {
+                const size_t scale_size = scale_values[i].size()*sizeof(float);
+
+                gguf_set_tensor_data(ctx_outs[cur_split].get(), ggml_get_name(scale_tensors[i]), scale_values[i].data());
+
+                fout.write((const char *) scale_values[i].data(), scale_size);
+                zeros(fout, GGML_PAD(scale_size, align) - scale_size);
+
+                total_size_new += scale_size;
+            }
         } // no --dry-run
     } // main loop
 

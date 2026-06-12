@@ -430,6 +430,62 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
     }
 }
 
+// NVFP4 quantization including the fp32 scale for each tensor
+void quantize_row_nvfp4_full_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k, float scale_fp32) {
+    static const int qk = QK_NVFP4; // qk = 64
+    static const int qk_sub = QK_NVFP4_SUB; // qk_sub = 16
+    static const int n_sub = QK_NVFP4 / QK_NVFP4_SUB; // n_sub = number of size 16 blocks
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk; // Number of chunks of size 64
+
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < n_sub; s++) {
+            const float * xb = x + i*qk + s*qk_sub; // ith chunk of 64 and sth chunk of 16 within that 64 chunk
+
+            float amax = 0.0f;
+            for (int j = 0; j < qk_sub; j++) {
+                if (amax < fabsf(xb[j])) {
+                    amax = fabsf(xb[j]);
+                }
+            }
+
+            if (amax == 0.0f) {
+                y[i].d[s] = 0;
+                memset(&y[i].qs[s*(qk_sub/2)], 0, qk_sub/2);
+                continue;
+            }
+
+            const uint8_t ue0 = ggml_fp32_to_ue4m3(amax / (6.0f * scale_fp32));
+
+            uint8_t best_ue  = ue0;
+            float   best_err = FLT_MAX;
+            for (int t = -4; t <= 2; ++t) {
+                const int uc = (int)ue0 + t;
+                if (uc < 1 || uc > 0x7E) {
+                    continue;
+                }
+                const float err = fp4_block_error(xb, qk_sub, ggml_ue4m3_to_fp32((uint8_t)uc) * scale_fp32);
+                if (err < best_err) {
+                    best_err = err;
+                    best_ue  = (uint8_t)uc; // UE4M3 scale: amax / 6.0 maps the max E2M1 value (6.0) to amax
+                }
+            }
+
+            y[i].d[s] = best_ue; // UE4M3 scale factor for block i
+            const float d = ggml_ue4m3_to_fp32(best_ue) * scale_fp32; // float version of scale factor
+
+            for (int j = 0; j < qk_sub/2; ++j) {
+                const uint8_t x0 = best_index_mxfp4(xb[0        + j], d); // Set first nibble of byte
+                const uint8_t x1 = best_index_mxfp4(xb[qk_sub/2 + j], d); // Set second nibble of byte
+
+                y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4); // x0 is bits 0:3, x1 is bits 4:7
+            }
+        }
+    }
+}
+
 /*
 Original versions for MXFP4 and NVFP4 Quantization
 
