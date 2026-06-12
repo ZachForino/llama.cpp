@@ -168,6 +168,7 @@ static void usage(const char * executable) {
     printf("-----------------------------------------------------------------------------\n");
     printf(" allowed quantization types\n");
     printf("-----------------------------------------------------------------------------\n\n");
+    printf("  --sr: use stochastic rounding instead of round-to-nearest (MXFP4/NVFP4 only)\n");
     for (const auto & it : QUANT_OPTIONS) {
         if (it.name != "COPY") {
             printf("  %2d  or  ", it.ftype);
@@ -445,6 +446,8 @@ int llama_quantize(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--dry-run") == 0) {
             params.dry_run = true;
+        } else if (strcmp(argv[arg_idx], "--sr") == 0) { // Currently only for NVFP4 and MXFP4
+            ggml_quantize_set_stochastic_rounding(true);
         } else if (strcmp(argv[arg_idx], "--allow-requantize") == 0) {
             params.allow_requantize = true;
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {

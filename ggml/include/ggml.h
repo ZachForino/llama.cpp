@@ -2776,6 +2776,9 @@ extern "C" {
     // some quantization type cannot be used without an importance matrix
     GGML_API bool ggml_quantize_requires_imatrix(enum ggml_type type);
 
+    // enable stochastic rounding for subsequent quantization (default: round-to-nearest) -- currently only for NVFP4 and MXFP4
+    GGML_API void ggml_quantize_set_stochastic_rounding(bool enable);
+
     // calls ggml_quantize_init internally (i.e. can allocate memory)
     GGML_API size_t ggml_quantize_chunk(
             enum ggml_type   type,

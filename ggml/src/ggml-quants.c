@@ -296,11 +296,56 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
     }
 }
 
+// stochastic rounding - enabled once by the quantize tool before worker
+// threads start, read-only during quantization
+static bool sr_enabled = false;
+
+void ggml_quantize_set_stochastic_rounding(bool enable) {
+    sr_enabled = enable;
+}
+
+static _Thread_local uint32_t sr_state = 0;
+
+static inline float sr_rand(void) {
+    uint32_t x = sr_state;
+    if (x == 0) {
+        x = (uint32_t)(uintptr_t)&sr_state | 1; // lazy per-thread seed
+    }
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    sr_state = x;
+    return (float)(x >> 8) * (1.0f/16777216.0f); // uniform [0, 1)
+}
+
 // kvalues_mxfp4 = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12]
 // x = value to quantize
 // e = scale factor as a dequantized float
+// If sr===true, use stochastic rounding, else round to nearest
 // best_index = best E2M1 value (scale_factor*kvalue_mxfp4[best_index] is the closest value to x)
-static inline int best_index_e2m1(float x, float e) {
+static inline int best_index_e2m1(float x, float e, bool sr) {
+    if (sr) {
+        // kvalues_mxfp4 sorted ascending, and the nibble index of each value
+        static const int8_t  sr_val[15] = {-12, -8, -6, -4, -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 12};
+        static const uint8_t sr_idx[15] = { 15,  14, 13, 12, 11, 10,  9, 0, 1, 2, 3, 4, 5, 6, 7};
+
+        const float t = x / e;
+
+        // values at the edges of the range can only be quantized to one value
+        if (t <= sr_val[0])  return sr_idx[0];
+        if (t >= sr_val[14]) return sr_idx[14];
+
+        int lo = 0;
+        while (t > (float) sr_val[lo + 1]) {
+            lo++;
+        }
+
+        const float qlow = sr_val[lo]; 
+        const float qhigh = sr_val[lo + 1];
+        const float p  = (t - qlow)/(qhigh - qlow); // P(round up)
+
+        return sr_rand() < p ? sr_idx[lo + 1] : sr_idx[lo];
+    }
     int best_index = 0;
     float best_err = fabsf(kvalues_mxfp4[0]*e - x);
     for (int i = 1; i < 16; i++) {
@@ -317,7 +362,7 @@ static inline int best_index_e2m1(float x, float e) {
 static float fp4_block_error(const float * GGML_RESTRICT x, int n, float d) {
     float err = 0.0f;
     for (int j = 0; j < n; ++j) {
-        const float xr   = d * kvalues_mxfp4[best_index_e2m1(x[j], d)];
+        const float xr   = d * kvalues_mxfp4[best_index_e2m1(x[j], d, sr_enabled)];
         const float diff = x[j] - xr;
         err += diff * diff;
     }
@@ -366,8 +411,8 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
         const float d = GGML_E8M0_TO_FP32_HALF(best_e); // d = 2^{e-128} (dequantized scale factor)
 
         for (int j = 0; j < qk/2; ++j) {
-            const uint8_t x0 = best_index_e2m1(x[i*qk + 0    + j], d); // Set first nibble of byte
-            const uint8_t x1 = best_index_e2m1(x[i*qk + qk/2 + j], d); // Set second nibble of byte
+            const uint8_t x0 = best_index_e2m1(x[i*qk + 0    + j], d, sr_enabled); // Set first nibble of byte
+            const uint8_t x1 = best_index_e2m1(x[i*qk + qk/2 + j], d, sr_enabled); // Set second nibble of byte
 
             y[i].qs[j]  = x0 | (x1 << 4); // x0 is bits 0:3, x1 is bits 4:7
         }
@@ -421,8 +466,8 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
             const float d = ggml_ue4m3_to_fp32(best_ue); // float version of scale factor
 
             for (int j = 0; j < qk_sub/2; ++j) {
-                const uint8_t x0 = best_index_e2m1(xb[0        + j], d); // Set first nibble of byte
-                const uint8_t x1 = best_index_e2m1(xb[qk_sub/2 + j], d); // Set second nibble of byte
+                const uint8_t x0 = best_index_e2m1(xb[0        + j], d, sr_enabled); // Set first nibble of byte
+                const uint8_t x1 = best_index_e2m1(xb[qk_sub/2 + j], d, sr_enabled); // Set second nibble of byte
 
                 y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4); // x0 is bits 0:3, x1 is bits 4:7
             }
@@ -477,8 +522,8 @@ void quantize_row_nvfp4_full_ref(const float * GGML_RESTRICT x, block_nvfp4 * GG
             const float d = ggml_ue4m3_to_fp32(best_ue) * scale_fp32; // float version of scale factor
 
             for (int j = 0; j < qk_sub/2; ++j) {
-                const uint8_t x0 = best_index_e2m1(xb[0        + j], d); // Set first nibble of byte
-                const uint8_t x1 = best_index_e2m1(xb[qk_sub/2 + j], d); // Set second nibble of byte
+                const uint8_t x0 = best_index_e2m1(xb[0        + j], d, sr_enabled); // Set first nibble of byte
+                const uint8_t x1 = best_index_e2m1(xb[qk_sub/2 + j], d, sr_enabled); // Set second nibble of byte
 
                 y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4); // x0 is bits 0:3, x1 is bits 4:7
             }
